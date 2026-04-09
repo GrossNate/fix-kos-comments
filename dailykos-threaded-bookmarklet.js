@@ -8,6 +8,7 @@
   const MAX_PAGES = 50;
   const PAGE_LIMIT = 100;
   const REPLY_LIMIT = 100;
+  const NAME_LOOKUP_CONCURRENCY = 8;
 
   function byTimeAsc(a, b) {
     const at = Number(a.time || a.date_created || 0);
@@ -222,6 +223,67 @@
     return d.toLocaleString();
   }
 
+  function uuidToNumericId(uuid) {
+    if (!uuid || typeof uuid !== "string") return null;
+    if (uuid === "00000000-0000-4000-8000-000000000000") return 0;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4000-800[0-9a-f]-[0-9a-f]{12}$/i.test(uuid)) return null;
+    const hex = uuid[22] + uuid.slice(24);
+    const numeric = parseInt(hex, 16);
+    if (Number.isNaN(numeric)) return null;
+    return numeric;
+  }
+
+  async function mapLimit(items, limit, mapper) {
+    const out = new Array(items.length);
+    let index = 0;
+
+    async function worker() {
+      while (index < items.length) {
+        const current = index;
+        index += 1;
+        out[current] = await mapper(items[current], current);
+      }
+    }
+
+    const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+    await Promise.all(workers);
+    return out;
+  }
+
+  async function resolveActorNames(hostname, comments) {
+    const actorUuids = Array.from(
+      new Set(
+        comments
+          .map((c) => c && c.actor_uuid)
+          .filter((id) => typeof id === "string" && id.length > 0)
+      )
+    );
+
+    const nameByActor = new Map();
+    if (!actorUuids.length) return nameByActor;
+
+    const host = encodeURIComponent(hostname);
+    await mapLimit(actorUuids, NAME_LOOKUP_CONCURRENCY, async (actorUuid) => {
+      const id = uuidToNumericId(actorUuid);
+      if (id === null) {
+        nameByActor.set(actorUuid, actorUuid);
+        return;
+      }
+
+      const url = `https://api.viafoura.co/v2/${host}/users/${id}`;
+      try {
+        const data = await fetchJson(url);
+        const result = data && data.result ? data.result : data;
+        const name = result && typeof result.name === "string" ? result.name.trim() : "";
+        nameByActor.set(actorUuid, name || actorUuid);
+      } catch (_) {
+        nameByActor.set(actorUuid, actorUuid);
+      }
+    });
+
+    return nameByActor;
+  }
+
   function renderError(root, message, onRetry) {
     const body = root.querySelector(`.${NS}__body`);
     body.innerHTML = "";
@@ -244,7 +306,7 @@
     body.appendChild(box);
   }
 
-  function renderCommentNode(comment, childrenByParent) {
+  function renderCommentNode(comment, childrenByParent, nameByActor) {
     const wrapper = document.createElement("div");
     wrapper.className = `${NS}__comment`;
 
@@ -253,7 +315,8 @@
 
     const author = document.createElement("span");
     author.className = `${NS}__author`;
-    author.textContent = comment.actor_uuid || "unknown-user";
+    const actorUuid = comment.actor_uuid || "";
+    author.textContent = (actorUuid && nameByActor.get(actorUuid)) || actorUuid || "unknown-user";
 
     const when = document.createElement("span");
     when.textContent = formatTimestamp(comment.time || comment.date_created);
@@ -290,7 +353,7 @@
       });
 
       for (const child of kids) {
-        childrenWrap.appendChild(renderCommentNode(child, childrenByParent));
+        childrenWrap.appendChild(renderCommentNode(child, childrenByParent, nameByActor));
       }
 
       wrapper.appendChild(toggle);
@@ -300,7 +363,7 @@
     return wrapper;
   }
 
-  function renderComments(root, comments, containerUuid, totalVisibleContent) {
+  function renderComments(root, comments, containerUuid, totalVisibleContent, nameByActor) {
     const body = root.querySelector(`.${NS}__body`);
     body.innerHTML = "";
 
@@ -330,7 +393,7 @@
     const orphans = comments.filter((c) => c && c.content_uuid && !reachable.has(c.content_uuid)).sort(byTimeAsc);
 
     for (const top of topLevel) {
-      body.appendChild(renderCommentNode(top, childrenByParent));
+      body.appendChild(renderCommentNode(top, childrenByParent, nameByActor));
     }
 
     if (orphans.length) {
@@ -342,7 +405,7 @@
       section.appendChild(title);
 
       for (const orphan of orphans) {
-        section.appendChild(renderCommentNode(orphan, childrenByParent));
+        section.appendChild(renderCommentNode(orphan, childrenByParent, nameByActor));
       }
 
       body.appendChild(section);
@@ -514,8 +577,15 @@
         const sectionUuid = await resolveSectionUuid(location.hostname);
         const lookup = await resolveContentContainerUuid(sectionUuid, vfContainerId);
         const comments = await fetchAllComments(sectionUuid, lookup.contentContainerUuid);
+        const nameByActor = await resolveActorNames(location.hostname, comments);
 
-        const summary = renderComments(root, comments, lookup.contentContainerUuid, lookup.totalVisibleContent);
+        const summary = renderComments(
+          root,
+          comments,
+          lookup.contentContainerUuid,
+          lookup.totalVisibleContent,
+          nameByActor
+        );
         const expected = summary.expectedVisible ? ` | visible: ${summary.expectedVisible}` : "";
         renderToolbar(
           root,
